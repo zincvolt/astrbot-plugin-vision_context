@@ -691,5 +691,5 @@ class Main(star.Star):
         )
         logger.info(
             f"[vision] injected {len(picked)} caption(s): "
-            + " | ".join(t[:30] for _, t in picked)
+            + " | ".join(p[:40] for p in picked)  # picked 是 "- 文本" 字符串列表
         )
