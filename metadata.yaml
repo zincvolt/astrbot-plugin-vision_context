@@ -1,4 +1,4 @@
 name: astrbot_plugin_vision_context
-desc: 群图上下文：后台给群里的图生成释义（带哈希缓存），回复时按需注入
+desc: 群图上下文：后台给群里的图生成释义（带哈希缓存），回复时按需注入。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
 author: local
 version: 1.0.0
