@@ -32,6 +32,65 @@ DECLARED_BEHAVIOR = "无斜线指令：为 /读图 提供图片上下文缓存�
 ROOT = Path(r"D:\QQNTBOT")
 BOT_DB = ROOT / "apps" / "AstrBot" / "data" / "data_v4.db"
 
+# ---------- 直连 token 账本（与 dashboard 共享 vision_usage.json）----------
+# 第三方识图走 httpx 直连、不经 provider，apimode 统计不到，这里自己记账。
+# 额度闸：超额后不再调 flash，图按「无描述」处理，peer 会按需发原图兜底。
+USAGE_FILE = ROOT / "data" / "vision_usage.json"
+_USAGE_CACHE: dict = {"mtime": 0.0, "data": {}}
+
+
+def _today() -> str:
+    return time.strftime("%Y%m%d")
+
+
+def _load_usage() -> dict:
+    """Read today's usage ledger, resetting when the date rolls over."""
+    global _USAGE_CACHE
+    try:
+        stat = USAGE_FILE.stat()
+    except OSError:
+        return {"date": _today(), "tokens": 0, "daily_limit": 100000, "enabled": True}
+    if _USAGE_CACHE["data"] and stat.st_mtime == _USAGE_CACHE["mtime"]:
+        data = dict(_USAGE_CACHE["data"])
+    else:
+        try:
+            data = json.loads(USAGE_FILE.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        _USAGE_CACHE = {"mtime": stat.st_mtime, "data": dict(data)}
+    data.setdefault("daily_limit", 100000)
+    data.setdefault("enabled", True)
+    if data.get("date") != _today():
+        data["date"] = _today()
+        data["tokens"] = 0
+    return data
+
+
+def _quota_ok() -> bool:
+    """Whether a new cloud caption call is allowed under today's budget."""
+    d = _load_usage()
+    if not d.get("enabled", True):
+        return False
+    limit = int(d.get("daily_limit") or 0)
+    if limit and int(d.get("tokens") or 0) >= limit:
+        return False
+    return True
+
+
+def _add_usage(tokens: int) -> None:
+    """Accumulate tokens into today's ledger (atomic enough: single writer)."""
+    if tokens <= 0:
+        return
+    d = _load_usage()
+    d["date"] = _today()
+    d["tokens"] = int(d.get("tokens") or 0) + int(tokens)
+    try:
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        _USAGE_CACHE = {"mtime": USAGE_FILE.stat().st_mtime, "data": dict(d)}
+    except OSError as exc:
+        logger.warning(f"[vision] usage ledger write failed: {exc}")
+
 # 识图后端按顺序试：先画面描述（VL），再只认文字的 OCR。
 # 8084 那个缓存代理已经不在 start-all 里了，别再把请求发过去空等超时。
 CAPTION_ENDPOINTS = [
@@ -510,6 +569,9 @@ class Main(star.Star):
         """
         if time.time() < _CLOUD_DOWN_UNTIL:
             return None
+        if not _quota_ok():
+            logger.info("[vision] 云端识图今日额度已满，跳过补描述（原图按需兜底）")
+            return None
         endpoint = _cloud_endpoint()
         if not endpoint:
             return None
@@ -546,7 +608,9 @@ class Main(star.Star):
                         json=body,
                     )
                     resp.raise_for_status()
-                    message = resp.json()["choices"][0]["message"]
+                    payload = resp.json()
+                    _add_usage(int((payload.get("usage") or {}).get("total_tokens") or 0))
+                    message = payload["choices"][0]["message"]
                     text = (message.get("content") or "").strip()
                     if not text and message.get("reasoning_content"):
                         logger.warning(
