@@ -81,6 +81,46 @@ COLLECT_DIR = (
 COLLECT_ENABLED = True
 COLLECT_MAX_BYTES = VISION_STICKER_BYTES   # 长图/截图/原图照片不进表情库
 
+# 「还没归类的表情，暂存区」这类占位文案对模型是零信息噪声，注入出去
+# 反而误导（模型以为知道图内容了）。低质描述一律不注入、不当描述用，
+# 该图按「没描述」处理（peer 那边会把原图发给模型兜底）。
+PLACEHOLDER_WORDS = ("暂存", "未归类", "未分类")
+
+# 判官触发的主动接话，只在这条话真的在谈图时才注入历史图描述。
+# 词表跟 peer 的读图闸保持一致（peer 改了这边跟着变），peer 没加载时用兜底词表。
+try:
+    from astrbot_plugin_peer.main import VISION_HINTS as IMAGE_REF_HINTS
+except Exception:  # noqa: BLE001 - peer 未加载时的本地兜底
+    IMAGE_REF_HINTS = (
+        "看图", "这图", "那张图", "刚才那张", "上一张", "图片", "图里", "图上",
+        "这是啥", "这啥", "是啥", "啥玩意", "什么东西", "啥东西", "啥意思",
+        "什么意思", "长啥样", "啥图", "什么图", "识别", "翻译", "描述一下",
+    )
+
+
+def caption_shaky(text: str) -> bool:
+    """Heuristic: is this caption too low-quality to trust as the image?
+
+    免费规则筛查，专抓 OCR 时代的纯文字抄写（「ARK RHODES ISLAND…」这种
+    只有 logo 文字、没有画面描述）和表情库占位文案。宁可错杀：被杀掉的
+    描述不发不发不注入，原图走真看图，只贵一次。
+
+    Args:
+        text: Cached caption or meme-pack description.
+
+    Returns:
+        True when the caption should not be trusted.
+    """
+    if not text or not text.strip():
+        return True
+    text = text.strip()
+    if len(text) < 10:
+        return True
+    if any(word in text for word in PLACEHOLDER_WORDS):
+        return True
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk / len(text) < 0.3
+
 
 def _cache_conn() -> sqlite3.Connection:
     """Open the shared caption cache.
@@ -577,9 +617,12 @@ class Main(star.Star):
                 logger.info(f"[vision] cache hit {sha[:8]}")
                 return
 
-            # 群里发的正好是表情库里收录过的图：直接给出已标记的含义，不跑 OCR
+            # 群里发的正好是表情库里收录过的图：直接给出已标记的含义，不跑 OCR。
+            # 「未分类」收件箱的描述是占位文案（「还没归类的表情，暂存区」），
+            # 当描述用只会误导模型——跳过，照常走识图流程让 flash 真看一眼，
+            # 描述进缓存后下次 cache hit 拿到的就是真内容。
             known = self.meme_index.get(sha[:16])
-            if known:
+            if known and known[1] != "未分类":
                 pack, category, desc = known
                 note = f"[表情库·{category}] {desc}"
                 self._recent[session].append((time.time(), note))
@@ -667,6 +710,19 @@ class Main(star.Star):
         buf = self._recent.get(session)
         if not buf:
             return
+        if group and event.get_extra("vision_judge_wake"):
+            # 判官触发的主动接话：判官不看图、也没人叫它，注入的东西它
+            # 需求说了算——只有当前这条话真的在谈图（带图或指图问）时，
+            # 历史图描述才帮得上忙；否则就是往无关闲聊里塞 15 分钟前的
+            # 旧图描述（2026-11-21）。直通唤醒/艾特唤醒不打这个标记，
+            # 注入行为不变。
+            has_image = bool(req.image_urls) or any(
+                isinstance(m, Image) for m in event.get_messages()
+            )
+            text = req.prompt or ""
+            if not has_image and not any(h in text for h in IMAGE_REF_HINTS):
+                logger.debug("[vision] judge wake, message not image-related, skip inject")
+                return
         now = time.time()
         # peer 已经把当前这条消息的图释义拼进 prompt 了，别再说一遍
         already = req.prompt or ""
@@ -679,6 +735,8 @@ class Main(star.Star):
                 break
             if text and text in already:
                 continue
+            if caption_shaky(text):
+                continue  # 占位/纯 OCR 抄写这类低质描述，注入出去只会误导
             picked.append(f"- {text}")
             budget -= len(text) + 2
         if not picked:
@@ -686,7 +744,8 @@ class Main(star.Star):
         joined = "\n".join(reversed(picked))
         req.system_prompt = (req.system_prompt or "") + (
             f"\n\n[{scope}最近发过的图（按时间从早到晚），对方问「这图/刚才那张图」"
-            "或引用消息带图时，优先对照下面的描述回答，不要说看不到]\n"
+            "或引用消息带图时，优先对照下面的描述回答，不要说看不到；"
+            "描述可能不完整，本轮消息里如果附了原图，以原图为准]\n"
             + joined
         )
         logger.info(
