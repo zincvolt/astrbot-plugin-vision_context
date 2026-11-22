@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import sqlite3
@@ -37,6 +38,18 @@ BOT_DB = ROOT / "apps" / "AstrBot" / "data" / "data_v4.db"
 # 额度闸：超额后不再调 flash，图按「无描述」处理，peer 会按需发原图兜底。
 USAGE_FILE = ROOT / "data" / "vision_usage.json"
 _USAGE_CACHE: dict = {"mtime": 0.0, "data": {}}
+# 当前识图归属的群号（由 watch_images/_store_caption 设置），分群额度与记账用。
+_VISION_GROUP: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "vision_group", default=""
+)
+
+# ---------- 识图自己的开关（独立于 apimode）----------
+# /读图 本地|第三方|关 写进 data/vision_mode.json，本插件按它决定去哪识图：
+#   本地  = 8085 描述 → 8083 OCR → flash 兜底
+#   第三方 = 本地服务本来就是停的，先试一轮纯属白等超时，直接走 flash
+#   关    = 不读图（连 flash 也不调），图按「没描述」处理
+MODE_FILE = ROOT / "data" / "vision_mode.json"
+_MODE_CACHE: tuple[float, str] = (0.0, "local")
 
 
 def _today() -> str:
@@ -60,20 +73,34 @@ def _load_usage() -> dict:
         _USAGE_CACHE = {"mtime": stat.st_mtime, "data": dict(data)}
     data.setdefault("daily_limit", 100000)
     data.setdefault("enabled", True)
+    data.setdefault("group_limits", {})
+    data.setdefault("groups", {})
     if data.get("date") != _today():
         data["date"] = _today()
         data["tokens"] = 0
+        data["groups"] = {}
     return data
 
 
 def _quota_ok() -> bool:
-    """Whether a new cloud caption call is allowed under today's budget."""
+    """Whether a new cloud caption call is allowed under today's budget.
+
+    全局额度是硬上限；本群额度（0=跟随全局）额外判一次。私聊/无群号只判全局。
+    """
     d = _load_usage()
     if not d.get("enabled", True):
         return False
     limit = int(d.get("daily_limit") or 0)
     if limit and int(d.get("tokens") or 0) >= limit:
         return False
+    gid = _VISION_GROUP.get()
+    if gid:
+        glimits = d.get("group_limits") or {}
+        glimit = int(glimits.get(gid) or 0)
+        if glimit:
+            gused = int((d.get("groups") or {}).get(gid) or 0)
+            if gused >= glimit:
+                return False
     return True
 
 
@@ -84,6 +111,11 @@ def _add_usage(tokens: int) -> None:
     d = _load_usage()
     d["date"] = _today()
     d["tokens"] = int(d.get("tokens") or 0) + int(tokens)
+    gid = _VISION_GROUP.get()
+    if gid:
+        groups = dict(d.get("groups") or {})
+        groups[gid] = int(groups.get(gid) or 0) + int(tokens)
+        d["groups"] = groups
     try:
         USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
         USAGE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -142,14 +174,14 @@ COLLECT_MAX_BYTES = VISION_STICKER_BYTES   # 长图/截图/原图照片不进表
 
 # 「还没归类的表情，暂存区」这类占位文案对模型是零信息噪声，注入出去
 # 反而误导（模型以为知道图内容了）。低质描述一律不注入、不当描述用，
-# 该图按「没描述」处理（peer 那边会把原图发给模型兜底）。
+# 该图按「没描述」处理（basicZ 那边会把原图发给模型兜底）。
 PLACEHOLDER_WORDS = ("暂存", "未归类", "未分类")
 
 # 判官触发的主动接话，只在这条话真的在谈图时才注入历史图描述。
-# 词表跟 peer 的读图闸保持一致（peer 改了这边跟着变），peer 没加载时用兜底词表。
+# 词表跟 basicZ 的读图闸保持一致（basicZ 改了这边跟着变），basicZ 没加载时用兜底词表。
 try:
-    from astrbot_plugin_peer.main import VISION_HINTS as IMAGE_REF_HINTS
-except Exception:  # noqa: BLE001 - peer 未加载时的本地兜底
+    from astrbot_plugin_basicz.main import VISION_HINTS as IMAGE_REF_HINTS
+except Exception:  # noqa: BLE001 - basicZ 未加载时的本地兜底
     IMAGE_REF_HINTS = (
         "看图", "这图", "那张图", "刚才那张", "上一张", "图片", "图里", "图上",
         "这是啥", "这啥", "是啥", "啥玩意", "什么东西", "啥东西", "啥意思",
@@ -293,6 +325,35 @@ _GC_AT = 0.0
 _CLOUD_SEM = asyncio.Semaphore(1)
 # 第三方端点解析结果缓存：(配置文件 mtime, (base, key, model) | None)
 _CLOUD_CACHE: tuple[float, tuple[str, str, str] | None] = (0.0, None)
+
+
+def _vision_mode() -> str:
+    """Return the vision backend chosen by ``/读图``.
+
+    按文件 mtime 缓存：切换模式立即生效，不用重启 AstrBot；
+    文件缺失或写坏时按 ``local`` 处理（保持旧行为）。
+
+    Returns:
+        ``local``, ``third_party`` or ``off``.
+    """
+    global _MODE_CACHE
+
+    try:
+        mtime = MODE_FILE.stat().st_mtime
+    except OSError:
+        return "local"
+    if _MODE_CACHE[0] == mtime:
+        return _MODE_CACHE[1]
+    try:
+        mode = str(
+            json.loads(MODE_FILE.read_text(encoding="utf-8-sig")).get("mode") or "local"
+        )
+    except (OSError, ValueError):
+        mode = "local"
+    if mode not in ("local", "third_party", "off"):
+        mode = "local"
+    _MODE_CACHE = (mtime, mode)
+    return mode
 
 
 def _allowed_groups() -> set[str]:
@@ -482,7 +543,10 @@ class Main(star.Star):
         return None
 
     async def _caption(self, ref: str, size: int = 0, raw: bytes = b"") -> str | None:
-        """Caption one image, trying local backends before spending tokens.
+        """Caption one image, following the ``/读图`` mode.
+
+        ``local`` 先试本地 VL/OCR、失败才用 flash 兜底；``third_party``
+        跳过本地直连 flash；``off`` 不读图。
 
         Args:
             ref: data URL, http URL or local path of the image.
@@ -510,6 +574,20 @@ class Main(star.Star):
         if not size:
             size = len(raw)
         instruction, max_tokens, cap = _caption_plan(size, raw)
+
+        mode = _vision_mode()
+        if mode == "off":
+            # /读图 关：连 flash 都不调，这张图按「没描述」处理
+            logger.debug("[vision] mode=off, skip caption")
+            return None
+        if mode == "third_party":
+            # 第三方模式：8083/8085 本来就是停的，先试一轮要白等 ~4 秒超时
+            # （回复会抢在描述前面发出去）。直接走 flash，实测 ~2 秒回来。
+            if 0 < size <= VISION_STICKER_BYTES:
+                text = await self._caption_cloud(image_url, instruction)
+                if text:
+                    return text[:cap]
+            return None
 
         if time.time() >= _LOCAL_DOWN_UNTIL:
             for url, key, model, _base_hint in CAPTION_ENDPOINTS:
@@ -631,6 +709,9 @@ class Main(star.Star):
         就用文字描述替换原图（一张原图 1000~2000 token）。私聊 session
         key 用 ``u<qq>``，群聊用群号，互不串。
         """
+        if _vision_mode() == "off":
+            # /读图 关：不下载、不识图，省流量也省 flash 额度
+            return
         group = str(event.get_group_id() or "")
         if group:
             if group not in _allowed_groups():
@@ -668,6 +749,8 @@ class Main(star.Star):
         """
         global _GC_AT
 
+        # 设置识图归属：群聊用群号，私聊用 u<qq>（私聊无分群额度，只记全局）
+        _VISION_GROUP.set(session if session and session.isdigit() else "")
         try:
             data = await self._read_bytes(ref)
             if not data:
@@ -690,6 +773,12 @@ class Main(star.Star):
                 pack, category, desc = known
                 note = f"[表情库·{category}] {desc}"
                 self._recent[session].append((time.time(), note))
+                # 同步落一份进共享缓存。basicZ 判断「这张图有没有描述」是查
+                # captions 表的，只放内存 ring buffer 它永远查不到，会白等满
+                # 整个等待窗口再把原图发出去（实测 caption wait 9.1s 0/1 landed，
+                # 那次图就是表情库里已收录的）。已有真描述就不覆盖。
+                if not cache_get(sha):
+                    cache_put(sha, note, len(data))
                 logger.info(f"[vision] known meme ({pack}/{category})")
                 return
 
